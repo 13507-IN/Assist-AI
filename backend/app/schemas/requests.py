@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from typing import Dict, List, Optional
 from datetime import datetime
 
@@ -6,11 +6,11 @@ from datetime import datetime
 class UserProfileRequest(BaseModel):
     """User profile input for company suggestions"""
     role: str
-    experience: int  # years
-    skills: List[str]
+    experience: int = Field(ge=0, le=60)
+    skills: List[str] = Field(min_length=1)
     location: str
     salary: Optional[int] = None
-    num_companies: int = 10
+    num_companies: int = Field(default=10, ge=1, le=20)
 
 
 class UserProfileResponse(BaseModel):
@@ -38,6 +38,8 @@ class CompanyResponse(BaseModel):
     outreach_method: Optional[str]
     outreach_instructions: Optional[str]
     tags: List[str]
+    source: Optional[str] = None
+    research_error: Optional[str] = None
 
 
 class CompanyListResponse(BaseModel):
@@ -66,11 +68,15 @@ class EmailResponse(BaseModel):
 class EmailSendRequest(BaseModel):
     """Email send request"""
     user_id: str
-    recipient_email: str
+    recipient_email: EmailStr
     company_id: str
     company_name: str
     subject: str
     body: str
+
+
+class EmailDraftRequest(EmailSendRequest):
+    """Editable email saved without sending."""
 
 
 class EmailLogResponse(BaseModel):
@@ -79,7 +85,9 @@ class EmailLogResponse(BaseModel):
     company_name: str
     recipient_email: str
     subject: str
+    body: str = ""
     status: str
+    error_message: Optional[str] = None
     created_at: datetime
     sent_at: Optional[datetime]
 
@@ -87,6 +95,8 @@ class EmailLogResponse(BaseModel):
 class ActivityResponse(BaseModel):
     """Activity log response"""
     total_emails_sent: int
+    total_drafts: int = 0
+    total_failed: int = 0
     emails: List[EmailLogResponse]
 
 
@@ -98,10 +108,10 @@ class LinkedInProfileRequest(BaseModel):
     location: str
     headline: Optional[str] = ""
     years_experience: int = 0
-    skills: List[str] = []
+    skills: List[str] = Field(default_factory=list)
     linkedin_url: Optional[str] = ""
     resume_url: Optional[str] = ""
-    common_answers: Dict[str, str] = {}
+    common_answers: Dict[str, str] = Field(default_factory=dict)
 
 
 class LinkedInJobRequest(BaseModel):
@@ -129,10 +139,10 @@ class LinkedInApplicationResponse(BaseModel):
     description: str
     status: str
     match_score: Optional[int] = None
-    matched_skills: List[str] = []
+    matched_skills: List[str] = Field(default_factory=list)
     tailored_summary: str = ""
     cover_letter: str = ""
-    screening_answers: Dict[str, str] = {}
+    screening_answers: Dict[str, str] = Field(default_factory=dict)
     note: str = ""
     created_at: datetime
     updated_at: datetime

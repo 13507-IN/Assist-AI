@@ -1,15 +1,15 @@
 {
   "scripts": {
     "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
-    "dev:backend": "cd backend && python main.py",
+    "dev:backend": ".\\backend\\.venv\\Scripts\\python.exe backend\\main.py",
     "dev:frontend": "cd frontend && npm run dev",
     "build": "npm run build:backend && npm run build:frontend",
-    "build:backend": "cd backend && pip install -r requirements.txt",
-    "build:frontend": "cd frontend && npm install && npm run build",
+    "build:backend": ".\\backend\\.venv\\Scripts\\python.exe -m compileall -q backend\\app",
+    "build:frontend": "cd frontend && npm run build",
     "docker-up": "docker-compose up --build",
     "docker-down": "docker-compose down",
     "test": "npm run test:backend && npm run test:frontend",
-    "test:backend": "cd backend && pytest",
+    "test:backend": ".\\backend\\.venv\\Scripts\\python.exe test_backend.py",
     "test:frontend": "cd frontend && npm test"
   },
   "devDependencies": {

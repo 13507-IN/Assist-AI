@@ -21,6 +21,8 @@ export interface Company {
   outreach_method?: string;
   outreach_instructions?: string;
   tags: string[];
+  source?: string;
+  research_error?: string;
 }
 
 export interface CompanyListResponse {
@@ -39,14 +41,37 @@ export interface EmailLog {
   company_name: string;
   recipient_email: string;
   subject: string;
+  body: string;
   status: string;
+  error_message?: string;
   created_at: string;
   sent_at?: string;
 }
 
 export interface ActivityResponse {
   total_emails_sent: number;
+  total_drafts: number;
+  total_failed: number;
   emails: EmailLog[];
+}
+
+export interface ServiceHealth {
+  status: 'ok' | 'error' | 'disconnected';
+  detail: string;
+  configured?: boolean;
+  connected?: boolean;
+  email?: string;
+}
+
+export interface HealthResponse {
+  status: 'healthy' | 'degraded';
+  service: string;
+  services: Record<string, ServiceHealth>;
+}
+
+export interface GmailStatus extends ServiceHealth {
+  configured: boolean;
+  connected: boolean;
 }
 
 export interface LinkedInProfile {

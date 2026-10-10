@@ -1,13 +1,27 @@
 'use client';
 
 import React, { useState } from 'react';
+import { useRouter } from 'next/navigation';
+import axios from 'axios';
 import useOutreachStore from '@/store/outreach';
 import apiService from '@/services/api';
 import Button from './Button';
 import Input from './Input';
+import { useToast } from './ToastProvider';
+
+const SEARCH_STEPS = [
+  'Validating your profile',
+  'Asking Gemini for structured company matches',
+  'Checking company websites (five at a time)',
+  'Saving verified results',
+];
 
 export const Dashboard: React.FC = () => {
   const { setUserProfile, setCompanyCategories, setIsLoading, isLoading } = useOutreachStore();
+  const router = useRouter();
+  const notify = useToast();
+  const [error, setError] = useState('');
+  const [progressStep, setProgressStep] = useState(-1);
   
   const [formData, setFormData] = useState({
     role: '',
@@ -32,11 +46,17 @@ export const Dashboard: React.FC = () => {
     e.preventDefault();
     
     if (!formData.role || !formData.location || !formData.skills) {
-      alert('Please fill in all required fields');
+      setError('Please fill in the role, skills and location fields.');
       return;
     }
 
+    setError('');
     setIsLoading(true);
+    setProgressStep(0);
+    const progressTimer = window.setInterval(
+      () => setProgressStep(current => Math.min(current + 1, SEARCH_STEPS.length - 2)),
+      1800
+    );
     
     try {
       const userProfile = {
@@ -52,14 +72,20 @@ export const Dashboard: React.FC = () => {
 
       const response = await apiService.generateCompanies(userProfile);
       setCompanyCategories(response.actively_hiring, response.strategic_targets);
-
-      // Navigate to results
-      window.location.href = '/results';
+      setProgressStep(SEARCH_STEPS.length - 1);
+      notify(`Saved ${response.total} company matches`, 'success');
+      router.push('/results');
     } catch (error) {
       console.error('Error generating companies:', error);
-      alert('Error generating companies. Please try again.');
+      const message = axios.isAxiosError(error)
+        ? error.response?.data?.detail || error.message
+        : 'Company search failed. Please try again.';
+      setError(message);
+      notify('Company search failed', 'error');
     } finally {
+      window.clearInterval(progressTimer);
       setIsLoading(false);
+      setProgressStep(-1);
     }
   };
 
@@ -70,6 +96,28 @@ export const Dashboard: React.FC = () => {
         <p className="text-slate-600 mb-8">
           Discover companies and generate personalized cold emails powered by AI
         </p>
+
+        {error && (
+          <div role="alert" className="mb-6 rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-800">
+            {error}
+          </div>
+        )}
+
+        {isLoading && (
+          <div className="mb-6 rounded-lg border border-blue-200 bg-blue-50 p-4">
+            <p className="mb-3 text-sm font-semibold text-blue-900">Search progress</p>
+            <ol className="space-y-2 text-sm">
+              {SEARCH_STEPS.map((step, index) => (
+                <li
+                  key={step}
+                  className={index <= progressStep ? 'font-medium text-blue-800' : 'text-slate-400'}
+                >
+                  {index < progressStep ? '✓' : index === progressStep ? '●' : '○'} {step}
+                </li>
+              ))}
+            </ol>
+          </div>
+        )}
 
         <form onSubmit={handleSubmit} className="space-y-6">
           <div>

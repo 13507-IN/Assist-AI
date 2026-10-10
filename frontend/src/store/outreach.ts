@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
 import { UserProfile, Company, Email } from '@/types';
 
 interface OutreachStore {
@@ -30,8 +31,8 @@ interface OutreachStore {
   reset: () => void;
 }
 
-const useOutreachStore = create<OutreachStore>((set) => ({
-  userId: '',
+const useOutreachStore = create<OutreachStore>()(persist((set) => ({
+  userId: 'local-user',
   userProfile: null,
   setUserProfile: (profile) => set({ userProfile: profile }),
 
@@ -61,6 +62,17 @@ const useOutreachStore = create<OutreachStore>((set) => ({
       generatedEmail: null,
       isLoading: false,
     }),
+}), {
+  name: 'outreach-ai-state',
+  partialize: (state) => ({
+    userId: state.userId,
+    userProfile: state.userProfile,
+    companies: state.companies,
+    activelyHiring: state.activelyHiring,
+    strategicTargets: state.strategicTargets,
+    selectedCompany: state.selectedCompany,
+    generatedEmail: state.generatedEmail,
+  }),
 }));
 
 export default useOutreachStore;

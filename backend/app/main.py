@@ -1,77 +1,87 @@
 import logging
-from fastapi import FastAPI, Depends, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+import secrets
+import time
 from contextlib import asynccontextmanager
-from app.models.database import connect_to_mongo, close_mongo_connection, get_database
+from datetime import datetime, timezone
+from typing import List, Optional
+from urllib.parse import urlencode
+
+from bson import ObjectId
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+
 from app.config import settings
+from app.models import database as database_module
+from app.models.database import (
+    close_mongo_connection,
+    connect_to_mongo,
+    database_status,
+    get_database,
+)
 from app.schemas.requests import (
-    UserProfileRequest, 
-    CompanyListResponse, 
     CompanyResponse,
+    CompanyListResponse,
+    EmailDraftRequest,
     EmailGenerationRequest,
+    EmailLogResponse,
     EmailResponse,
     EmailSendRequest,
-    EmailLogResponse,
     ActivityResponse,
-    LinkedInProfileRequest,
-    LinkedInJobRequest,
+    LinkedInApplicationResponse,
     LinkedInApplicationUpdate,
-    LinkedInApplicationResponse
+    LinkedInJobRequest,
+    LinkedInProfileRequest,
+    UserProfileRequest,
 )
-from app.services.company_service import CompanyResearchService, EmailGenerationService, GmailService
-from app.agents.outreach_graph import (
-    CompanyFinderAgent, 
-    HiringClassifierAgent, 
-    CompanyResearchAgent, 
-    OutreachStrategyAgent,
-    create_agent_graph,
-    AgentState
-)
-from langchain_google_genai import ChatGoogleGenerativeAI
-from datetime import datetime
-from typing import List
-import json
+from app.services.company_service import CompanyResearchService
+from app.services.gemini_service import GeminiService
+from app.services.gmail_service import GmailService
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize services
-llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", google_api_key=settings.gemini_api_key)
 company_research_service = CompanyResearchService()
-email_generation_service = EmailGenerationService(llm)
+gemini_service = GeminiService()
 gmail_service = GmailService()
-
-# Initialize agents
-company_finder = CompanyFinderAgent(llm)
-hiring_classifier = HiringClassifierAgent(llm)
-research_agent = CompanyResearchAgent(llm, company_research_service)
-strategy_agent = OutreachStrategyAgent(llm)
-
-# Create agent graph
-agent_graph = create_agent_graph(
-    company_finder,
-    hiring_classifier,
-    research_agent,
-    strategy_agent
-)
+OAUTH_STATE_TTL_SECONDS = 600
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI lifespan context manager"""
-    # Startup
     logger.info("Starting OutreachAI Backend...")
+    missing = [
+        key
+        for key, value in {
+            "GEMINI_API_KEY": settings.gemini_api_key,
+            "GMAIL_CLIENT_ID": settings.gmail_client_id,
+            "GMAIL_CLIENT_SECRET": settings.gmail_client_secret,
+        }.items()
+        if not value or value.startswith("your_")
+    ]
+    if missing:
+        logger.error("Missing settings in backend/.env: %s", ", ".join(missing))
+
     await connect_to_mongo()
     await company_research_service.initialize()
-    logger.info("Services initialized")
+    startup_checks = {
+        "mongodb": await database_status(),
+        "gemini": await gemini_service.status(),
+        "gmail": await gmail_service.status(database_module.db),
+    }
+    app.state.startup_checks = startup_checks
+    for service, result in startup_checks.items():
+        log = logger.info if result["status"] == "ok" else logger.error
+        log("%s startup check: %s - %s", service, result["status"], result["detail"])
     
     yield
     
-    # Shutdown
     logger.info("Shutting down OutreachAI Backend...")
     await close_mongo_connection()
     await company_research_service.close()
+    await gemini_service.close()
     logger.info("Services shutdown")
 
 
@@ -117,212 +127,190 @@ def serialize_linkedin_application(application: dict) -> LinkedInApplicationResp
 # Health check
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy", "service": "OutreachAI Backend"}
+    """Report each external dependency instead of hiding partial failures."""
+    services = {
+        "backend": {"status": "ok", "detail": "API is running"},
+        "mongodb": await database_status(),
+        "gemini": await gemini_service.status(),
+        "gmail": await gmail_service.status(database_module.db),
+    }
+    overall = "healthy" if all(
+        service["status"] == "ok" for service in services.values()
+    ) else "degraded"
+    return {"status": overall, "service": "OutreachAI Backend", "services": services}
 
 
-# API Routes
+def company_response(company: dict) -> CompanyResponse:
+    return CompanyResponse(
+        id=str(company["_id"]),
+        name=company["name"],
+        website=company.get("website"),
+        hiring_signal=company.get("hiring_signal", "unknown"),
+        summary=company.get("summary") or company.get("reasoning", ""),
+        domain=company.get("domain"),
+        relevance_score=company.get("relevance_score", 0),
+        tech_signals=company.get("tech_signals", []),
+        outreach_method=company.get("outreach_method"),
+        outreach_instructions=company.get("outreach_instructions"),
+        tags=company.get("tags", []),
+        source=company.get("source"),
+        research_error=company.get("research_error"),
+    )
+
+
+def company_id(value: str):
+    return ObjectId(value) if ObjectId.is_valid(value) else value
+
 
 @app.post("/api/generate-companies", response_model=CompanyListResponse)
-async def generate_companies(
-    request: UserProfileRequest,
-    db=Depends(get_database)
-):
-    """
-    Generate company suggestions based on user profile
-    """
-    logger.info(f"Generating companies for role: {request.role}")
-    
+async def generate_companies(request: UserProfileRequest, db=Depends(get_database)):
+    """Generate structured suggestions, verify their sites concurrently, and persist them."""
+    logger.info("Generating %s companies for role: %s", request.num_companies, request.role)
     try:
-        # Create initial state
-        initial_state: AgentState = {
-            "user_profile": {
-                "role": request.role,
-                "experience": request.experience,
-                "skills": request.skills,
-                "location": request.location,
-                "salary": request.salary,
-                "num_companies": request.num_companies,
-            },
-            "companies": [],
-            "current_company": {},
-            "research_data": {},
-            "outreach_strategy": {},
-            "generated_email": {},
-            "messages": []
-        }
-        
-        # Run agent graph
-        result = agent_graph.invoke(initial_state)
-        
-        companies = result.get("companies", [])
-        
-        # Separate active and inactive
-        active = [
-            CompanyResponse(
-                id=str(i),
-                name=c.get("name"),
-                website=c.get("website"),
-                hiring_signal=c.get("classification", "unknown"),
-                summary=c.get("summary", ""),
-                domain=c.get("domain", ""),
-                relevance_score=0.8,
-                tech_signals=[],
-                outreach_method=c.get("method", "email"),
-                tags=[]
-            )
-            for i, c in enumerate(companies)
-            if c.get("classification") == "active"
-        ]
-        
-        inactive = [
-            CompanyResponse(
-                id=str(i + len(active)),
-                name=c.get("name"),
-                website=c.get("website"),
-                hiring_signal=c.get("classification", "unknown"),
-                summary=c.get("summary", ""),
-                domain=c.get("domain", ""),
-                relevance_score=0.6,
-                tech_signals=[],
-                outreach_method=c.get("method", "linkedin"),
-                tags=[]
-            )
-            for i, c in enumerate(companies)
-            if c.get("classification") != "active"
-        ]
-        
-        # Store in MongoDB
-        if companies:
-            await db.companies.insert_many([
-                {
-                    "name": c.get("name"),
-                    "website": c.get("website"),
-                    "hiring_signal": c.get("classification"),
-                    "created_at": datetime.utcnow(),
-                    "user_profile": initial_state["user_profile"]
-                }
-                for c in companies
-            ])
-        
-        return CompanyListResponse(
-            total=len(companies),
-            actively_hiring=active,
-            strategic_targets=inactive
+        suggestions = await gemini_service.find_companies(
+            role=request.role,
+            experience=request.experience,
+            skills=request.skills,
+            location=request.location,
+            salary=request.salary,
+            count=request.num_companies,
         )
-    
-    except Exception as e:
-        logger.error(f"Error generating companies: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        if not suggestions:
+            raise RuntimeError("Gemini returned no companies")
+
+        companies = await company_research_service.research_companies(suggestions)
+        now = datetime.now(timezone.utc)
+        profile = request.model_dump()
+        documents = [
+            {**company, "user_profile": profile, "created_at": now, "updated_at": now}
+            for company in companies
+        ]
+        result = await db.companies.insert_many(documents)
+        for document, inserted_id in zip(documents, result.inserted_ids):
+            document["_id"] = inserted_id
+
+        active = [company_response(c) for c in documents if c["hiring_signal"] == "active"]
+        strategic = [company_response(c) for c in documents if c["hiring_signal"] != "active"]
+        return CompanyListResponse(
+            total=len(documents),
+            actively_hiring=active,
+            strategic_targets=strategic,
+        )
+    except RuntimeError as exc:
+        logger.error("Company generation failed: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Company generation failed")
+        raise HTTPException(status_code=502, detail=f"Company search failed: {exc}") from exc
 
 
 @app.post("/api/generate-email", response_model=EmailResponse)
 async def generate_email(request: EmailGenerationRequest):
-    """
-    Generate personalized cold email
-    """
-    logger.info(f"Generating email for {request.company_name}")
-    
+    logger.info("Generating email for %s", request.company_name)
     try:
-        email = await email_generation_service.generate_email(
+        email = await gemini_service.generate_email(
             user_role=request.user_role,
             user_skills=request.user_skills,
             company_name=request.company_name,
             company_summary=request.company_summary,
-            company_domain=request.company_name
         )
-        
-        return EmailResponse(
-            subject=email.get("subject", "Let's Connect"),
-            body=email.get("body", "")
-        )
-    
-    except Exception as e:
-        logger.error(f"Error generating email: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return EmailResponse(**email)
+    except Exception as exc:
+        logger.error("Email generation failed: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+def email_log_document(request: EmailSendRequest, status: str, error: Optional[str] = None) -> dict:
+    now = datetime.now(timezone.utc)
+    return {
+        "user_id": request.user_id,
+        "company_id": company_id(request.company_id),
+        "company_name": request.company_name,
+        "recipient_email": str(request.recipient_email),
+        "subject": request.subject,
+        "body": request.body,
+        "status": status,
+        "error_message": error,
+        "created_at": now,
+        "sent_at": now if status == "sent" else None,
+    }
+
+
+@app.post("/api/email-drafts", status_code=201)
+async def save_email_draft(request: EmailDraftRequest, db=Depends(get_database)):
+    result = await db.email_logs.insert_one(email_log_document(request, "drafted"))
+    return {"success": True, "id": str(result.inserted_id)}
+
+
+@app.get("/api/companies/{company_id_value}/email-status")
+async def company_email_status(
+    company_id_value: str,
+    user_id: str = "local-user",
+    db=Depends(get_database),
+):
+    previous = await db.email_logs.find_one(
+        {
+            "user_id": user_id,
+            "company_id": company_id(company_id_value),
+            "status": "sent",
+        },
+        sort=[("sent_at", -1)],
+    )
+    return {
+        "contacted": previous is not None,
+        "last_sent_at": previous.get("sent_at") if previous else None,
+        "recipient_email": previous.get("recipient_email") if previous else None,
+    }
 
 
 @app.post("/api/send-email")
-async def send_email(
-    request: EmailSendRequest,
-    db=Depends(get_database)
-):
-    """
-    Send email via Gmail API
-    """
-    logger.info(f"Sending email to {request.recipient_email}")
-    
-    try:
-        # Get user and their Gmail credentials
-        user = await db.users.find_one({"_id": request.user_id})
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-        
-        # Note: In production, use OAuth credentials properly
-        result = await gmail_service.send_email(
-            to_email=request.recipient_email,
-            subject=request.subject,
-            body=request.body,
-            user_email=user.get("email")
-        )
-        
-        # Log email
-        if result.get("success"):
-            await db.email_logs.insert_one({
-                "user_id": request.user_id,
-                "company_id": request.company_id,
-                "company_name": request.company_name,
-                "recipient_email": request.recipient_email,
-                "subject": request.subject,
-                "body": request.body,
-                "status": "sent",
-                "created_at": datetime.utcnow(),
-                "sent_at": datetime.utcnow()
-            })
-        
-        return result
-    
-    except Exception as e:
-        logger.error(f"Error sending email: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+async def send_email(request: EmailSendRequest, db=Depends(get_database)):
+    logger.info("Sending email to %s", request.recipient_email)
+    result = await gmail_service.send_email(
+        db=db,
+        user_id=request.user_id,
+        to_email=str(request.recipient_email),
+        subject=request.subject,
+        body=request.body,
+    )
+    status = "sent" if result.get("success") else "failed"
+    log_result = await db.email_logs.insert_one(
+        email_log_document(request, status, result.get("error"))
+    )
+    result["log_id"] = str(log_result.inserted_id)
+    return result
 
 
-@app.get("/api/activity")
+@app.get("/api/activity", response_model=ActivityResponse)
 async def get_activity(
-    user_id: str,
-    db=Depends(get_database)
+    user_id: str = "local-user",
+    status: Optional[str] = None,
+    db=Depends(get_database),
 ):
-    """
-    Get user's email activity log
-    """
-    try:
-        from bson import ObjectId
-        
-        logs = await db.email_logs.find({
-            "user_id": ObjectId(user_id)
-        }).sort("created_at", -1).limit(50).to_list(None)
-        
-        emails = [
-            EmailLogResponse(
-                id=str(log["_id"]),
-                company_name=log.get("company_name"),
-                recipient_email=log.get("recipient_email"),
-                subject=log.get("subject"),
-                status=log.get("status"),
-                created_at=log.get("created_at"),
-                sent_at=log.get("sent_at")
-            )
-            for log in logs
-        ]
-        
-        return ActivityResponse(
-            total_emails_sent=len([e for e in emails if e.status == "sent"]),
-            emails=emails
+    query = {"user_id": user_id}
+    if status in {"drafted", "sent", "failed"}:
+        query["status"] = status
+    logs = await db.email_logs.find(query).sort("created_at", -1).limit(100).to_list()
+    emails = [
+        EmailLogResponse(
+            id=str(log["_id"]),
+            company_name=log.get("company_name", ""),
+            recipient_email=log.get("recipient_email", ""),
+            subject=log.get("subject", ""),
+            body=log.get("body", ""),
+            status=log.get("status", "drafted"),
+            error_message=log.get("error_message"),
+            created_at=log.get("created_at"),
+            sent_at=log.get("sent_at"),
         )
-    
-    except Exception as e:
-        logger.error(f"Error getting activity: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        for log in logs
+    ]
+    return ActivityResponse(
+        total_emails_sent=sum(email.status == "sent" for email in emails),
+        total_drafts=sum(email.status == "drafted" for email in emails),
+        total_failed=sum(email.status == "failed" for email in emails),
+        emails=emails,
+    )
 
 
 @app.get("/api/linkedin/profile")
@@ -463,21 +451,80 @@ async def update_linkedin_application(
     return serialize_linkedin_application(result)
 
 
-@app.post("/api/auth/gmail/callback")
-async def gmail_auth_callback(code: str, db=Depends(get_database)):
-    """
-    Handle Gmail OAuth callback
-    """
-    logger.info("Processing Gmail OAuth callback")
-    
+@app.get("/api/auth/gmail/start")
+async def gmail_auth_start(
+    user_id: str = "local-user",
+    db=Depends(get_database),
+):
+    """Start the server-side Google OAuth flow with persisted CSRF/PKCE state."""
+    state = secrets.token_urlsafe(32)
     try:
-        # Exchange code for credentials (implementation depends on your OAuth setup)
-        # This is a placeholder
-        return {"success": True, "message": "Gmail authentication successful"}
-    
-    except Exception as e:
-        logger.error(f"Error in Gmail callback: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        await db.oauth_states.delete_many(
+            {"created_at": {"$lt": time.time() - OAUTH_STATE_TTL_SECONDS}}
+        )
+        authorization_url, code_verifier = gmail_service.authorization_url(state)
+        await db.oauth_states.insert_one(
+            {
+                "state": state,
+                "user_id": user_id,
+                "code_verifier": code_verifier,
+                "created_at": time.time(),
+            }
+        )
+        return RedirectResponse(authorization_url)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/api/auth/gmail/callback")
+async def gmail_auth_callback(
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+    error_description: Optional[str] = None,
+    db=Depends(get_database),
+):
+    """Exchange the OAuth code, persist the renewable token, and return to the app."""
+    def back_to_app(message: str) -> RedirectResponse:
+        logger.error("Gmail OAuth callback failed: %s", message)
+        query = urlencode({"gmail": "error", "message": message})
+        return RedirectResponse(f"{settings.frontend_url}/?{query}")
+
+    if error:
+        if state:
+            await db.oauth_states.delete_one({"state": state})
+        return back_to_app(error_description or error)
+    if not code or not state:
+        if state:
+            await db.oauth_states.delete_one({"state": state})
+        return back_to_app("Google did not return an authorization code and state.")
+
+    pending = await db.oauth_states.find_one_and_delete({"state": state})
+    if not pending:
+        return back_to_app("Gmail sign-in expired or was already used. Please try again.")
+    if time.time() - pending["created_at"] > OAUTH_STATE_TTL_SECONDS:
+        return back_to_app("Gmail sign-in expired. Please try again.")
+
+    try:
+        email = await gmail_service.exchange_code(
+            code,
+            state,
+            db,
+            pending["user_id"],
+            pending.get("code_verifier"),
+        )
+        query = urlencode({"gmail": "connected", "email": email})
+        return RedirectResponse(f"{settings.frontend_url}/?{query}")
+    except Exception as exc:
+        return back_to_app(str(exc))
+
+
+@app.get("/api/auth/gmail/status")
+async def gmail_auth_status(
+    user_id: str = "local-user",
+    db=Depends(get_database),
+):
+    return await gmail_service.status(db, user_id)
 
 
 if __name__ == "__main__":

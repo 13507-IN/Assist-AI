@@ -1,10 +1,11 @@
 import axios, { AxiosInstance } from 'axios';
 import {
   UserProfile, CompanyListResponse, Email, ActivityResponse,
-  LinkedInApplication, LinkedInJobInput, LinkedInProfile
+  GmailStatus, HealthResponse, LinkedInApplication, LinkedInJobInput, LinkedInProfile
 } from '@/types';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api';
+const BACKEND_URL = API_BASE_URL.replace(/\/api\/?$/, '');
 
 class ApiService {
   private client: AxiosInstance;
@@ -49,7 +50,7 @@ class ApiService {
     companyName: string,
     subject: string,
     body: string
-  ): Promise<{ success: boolean; message_id?: string; error?: string }> {
+  ): Promise<{ success: boolean; message_id?: string; error?: string; log_id?: string }> {
     const response = await this.client.post('/send-email', {
       user_id: userId,
       recipient_email: recipientEmail,
@@ -61,11 +62,56 @@ class ApiService {
     return response.data;
   }
 
-  async getActivity(userId: string): Promise<ActivityResponse> {
-    const response = await this.client.get('/activity', {
+  async saveDraft(
+    userId: string,
+    recipientEmail: string,
+    companyId: string,
+    companyName: string,
+    subject: string,
+    body: string
+  ): Promise<{ success: boolean; id: string }> {
+    const response = await this.client.post('/email-drafts', {
+      user_id: userId,
+      recipient_email: recipientEmail,
+      company_id: companyId,
+      company_name: companyName,
+      subject,
+      body,
+    });
+    return response.data;
+  }
+
+  async getCompanyEmailStatus(
+    companyId: string,
+    userId: string
+  ): Promise<{ contacted: boolean; last_sent_at?: string; recipient_email?: string }> {
+    const response = await this.client.get(`/companies/${companyId}/email-status`, {
       params: { user_id: userId },
     });
     return response.data;
+  }
+
+  async getActivity(userId: string, status?: string): Promise<ActivityResponse> {
+    const response = await this.client.get('/activity', {
+      params: { user_id: userId, status },
+    });
+    return response.data;
+  }
+
+  async getHealth(): Promise<HealthResponse> {
+    const response = await axios.get(`${BACKEND_URL}/health`, { timeout: 10000 });
+    return response.data;
+  }
+
+  async getGmailStatus(userId: string): Promise<GmailStatus> {
+    const response = await this.client.get('/auth/gmail/status', {
+      params: { user_id: userId },
+    });
+    return response.data;
+  }
+
+  gmailConnectUrl(userId: string): string {
+    return `${API_BASE_URL}/auth/gmail/start?user_id=${encodeURIComponent(userId)}`;
   }
 
   async getLinkedInProfile(): Promise<LinkedInProfile | null> {
